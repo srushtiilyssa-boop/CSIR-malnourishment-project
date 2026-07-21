@@ -1,5 +1,0 @@
-flwr[simulation]>=1.5.0
-torch
-pandas
-scikit-learn
-numpy
