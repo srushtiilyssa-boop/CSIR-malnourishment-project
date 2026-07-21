@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Child Malnutrition Classifier</title>
+    <style>
+        body { font-family: Arial, sans-serif; background-color: #f4f7f6; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; }
+        .card { background: white; padding: 30px; border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.1); width: 350px; }
+        h2 { text-align: center; margin-bottom: 20px; color: #333; }
+        label { font-weight: bold; font-size: 14px; color: #555; }
+        input, select { width: 100%; padding: 10px; margin: 8px 0 16px; border: 1px solid #ccc; border-radius: 6px; box-sizing: border-box; }
+        button { width: 100%; padding: 12px; background: #007bff; color: white; border: none; border-radius: 6px; font-size: 16px; cursor: pointer; }
+        button:hover { background: #0056b3; }
+        .result { margin-top: 20px; padding: 12px; text-align: center; font-weight: bold; border-radius: 6px; display: none; }
+        .Healthy { background-color: #d4edda; color: #155724; }
+        .Malnourished { background-color: #f8d7da; color: #721c24; }
+    </style>
+</head>
+<body>
+
+<div class="card">
+    <h2>Child Health Status Predictor</h2>
+    
+    <label>Age (in Months)</label>
+    <input type="number" id="age" placeholder="e.g., 24" required>
+
+    <label>Gender</label>
+    <select id="gender">
+        <option value="1">Male</option>
+        <option value="2">Female</option>
+    </select>
+
+    <label>Height (cm)</label>
+    <input type="number" step="0.1" id="height" placeholder="e.g., 85.0" required>
+
+    <label>Weight (kg)</label>
+    <input type="number" step="0.1" id="weight" placeholder="e.g., 10.5" required>
+
+    <button onclick="predictStatus()">Check Status</button>
+
+    <div id="resultBox" class="result"></div>
+</div>
+
+<script>
+async function predictStatus() {
+    const age = document.getElementById("age").value;
+    const gender = document.getElementById("gender").value;
+    const height = document.getElementById("height").value;
+    const weight = document.getElementById("weight").value;
+    const resultBox = document.getElementById("resultBox");
+
+    if(!age || !height || !weight) {
+        alert("Please fill in all fields!");
+        return;
+    }
+
+    const response = await fetch("/predict", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ age, gender, height, weight })
+    });
+
+    const data = await response.json();
+
+    if (data.success) {
+        resultBox.style.display = "block";
+        resultBox.className = "result " + data.prediction;
+        resultBox.innerHTML = `Status: ${data.prediction}<br><small>Confidence: ${data.confidence}%</small>`;
+    } else {
+        alert("Error: " + data.error);
+    }
+}
+</script>
+
+</body>
+</html>
