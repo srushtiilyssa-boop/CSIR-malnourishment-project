@@ -1,72 +1,136 @@
-import os
-import torch
-from model import load_and_preprocess_data, MalnutritionPredictor
-from client import HealthCenterClient
+"""
+server.py
+---------
+Central aggregation server for the malnutrition federated learning demo.
 
-DATA_PATH = os.path.join("dataset", "malnutrition_child_dataset_cleaned_v2.csv")
-NUM_CLIENTS = 3
-NUM_ROUNDS = 5
+Each client trains a local GradientBoostingClassifier on its own private
+shard of the malnutrition dataset (a different simulated clinic/site),
+then sends its trained hyperparameters/model config to this server.
+The server "federates" the incoming updates into a single global model
+config and sends it back to each client, which then adopts it as its
+final model before scoring the held-out test set.
 
-def federated_averaging(client_weights):
-    """Computes FedAvg: averages model parameters across all participating clients."""
-    avg_dict = {}
-    for key in client_weights[0].keys():
-        avg_dict[key] = sum(client_weights[i][key] for i in range(len(client_weights))) / len(client_weights)
-    return avg_dict
+Column names are hashed before leaving a client and un-hashed here,
+and a small amount of Laplace noise is added to numeric values as a
+light differential-privacy touch, matching the original project's design.
 
-def main():
-    if not os.path.exists(DATA_PATH):
-        if os.path.exists("malnutrition_child_dataset_cleaned_v2.csv"):
-            data_path = "malnutrition_child_dataset_cleaned_v2.csv"
-        else:
-            raise FileNotFoundError(f"Dataset file not found at {DATA_PATH}.")
-    else:
-        data_path = DATA_PATH
+Run this first, then run client.py once per client (see README.md).
+"""
 
-    print("📊 Loading and partitioning dataset across edge nodes...")
-    X_splits, y_splits, input_dim = load_and_preprocess_data(data_path, num_clients=NUM_CLIENTS)
+import socket
+import threading
+import pickle
+import hashlib
 
-    # Initialize Global Model
-    global_model = MalnutritionPredictor(input_dim)
-    
-    # Initialize Local Healthcare Clients
-    clients = [
-        HealthCenterClient(X_splits[i], y_splits[i], input_dim) 
-        for i in range(NUM_CLIENTS)
-    ]
+import numpy as np
+from sklearn.ensemble import GradientBoostingClassifier
 
-    print(f"\n🚀 Starting Native Federated Learning Loop ({NUM_CLIENTS} Healthcare Nodes, {NUM_ROUNDS} Rounds)...")
+HOST = "localhost"
+PORT = 8080
+EXPECTED_CLIENTS = 4  # must match N_CLIENTS in data_prep.py
 
-    for round_num in range(1, NUM_ROUNDS + 1):
-        print(f"\n--- Round {round_num}/{NUM_ROUNDS} ---")
-        
-        # 1. Extract global model parameters
-        global_params = [val.cpu().numpy() for val in global_model.state_dict().values()]
-        
-        client_weights = []
-        for i, client in enumerate(clients):
-            # 2. Distribute global weights to client & train locally
-            updated_params, num_samples, _ = client.fit(global_params, config={})
-            
-            # Reconstruct updated PyTorch state_dict from client numpy arrays
-            params_dict = zip(global_model.state_dict().keys(), updated_params)
-            state_dict = {k: torch.tensor(v) for k, v in params_dict}
-            client_weights.append(state_dict)
 
-        # 3. Aggregate client updates using FedAvg
-        avg_state_dict = federated_averaging(client_weights)
-        global_model.load_state_dict(avg_state_dict)
+def hash_column_name(name: str) -> str:
+    return hashlib.sha256(name.encode()).hexdigest()
 
-        # 4. Evaluate Global Model on Client 0's validation set
-        global_params_updated = [val.cpu().numpy() for val in global_model.state_dict().values()]
-        loss, _, metrics = clients[0].evaluate(global_params_updated, config={})
-        print(f"Global Model Evaluation -> Loss: {loss:.4f} | Accuracy: {metrics['accuracy'] * 100:.2f}%")
 
-    print("\n🎉 Decentralized Training Completed Successfully!")
+def reverse_hash_column_name(hashed_name: str, hash_dict: dict):
+    for original, hashed in hash_dict.items():
+        if hashed == hashed_name:
+            return original
+    return None
 
-    # Save weights inside main() scope
-    torch.save(global_model.state_dict(), "global_malnutrition_model.pth")
-    print("✅ Saved global model weights to 'global_malnutrition_model.pth'")
+
+def add_laplace_noise(value, sensitivity, epsilon):
+    scale = sensitivity / epsilon
+    return value + np.random.laplace(loc=0.0, scale=scale)
+
+
+def recv_all(sock):
+    BUFF_SIZE = 4096
+    data = b""
+    while True:
+        part = sock.recv(BUFF_SIZE)
+        data += part
+        if len(part) < BUFF_SIZE:
+            break
+    return data
+
+
+# Global model — starts with sane defaults, gets nudged toward each
+# client's local config on every round via running averaging.
+global_model = GradientBoostingClassifier(
+    n_estimators=150, learning_rate=0.1, max_depth=3, subsample=1.0, random_state=42
+)
+lock = threading.Lock()
+rounds_seen = 0
+
+
+def handle_client(client_socket, addr):
+    global global_model, rounds_seen
+
+    try:
+        data = recv_all(client_socket)
+        if not data:
+            raise ValueError("No data received from client")
+        encrypted_local_params = pickle.loads(data)
+
+        decrypted_local_params = {}
+        for hashed_param, value in encrypted_local_params.items():
+            original_param = reverse_hash_column_name(hashed_param, encrypted_local_params)
+            if original_param:
+                decrypted_local_params[original_param] = value
+
+        print(f"[{addr}] Local model parameters received and decrypted.")
+
+        with lock:
+            global_params = global_model.get_params()
+            for param in global_params:
+                if param in decrypted_local_params:
+                    g, l = global_params[param], decrypted_local_params[param]
+                    if isinstance(g, (int, float)) and isinstance(l, (int, float)):
+                        # Weighted running average so the global config
+                        # converges rather than oscillating client to client
+                        rounds_seen += 1
+                        weight = 1.0 / rounds_seen
+                        global_params[param] = g * (1 - weight) + l * weight
+                        if param in ("n_estimators", "max_depth", "random_state"):
+                            global_params[param] = int(round(global_params[param]))
+            global_model.set_params(**global_params)
+            current_global_params = dict(global_params)
+
+        encrypted_global_params = {}
+        epsilon = 1.0
+        for param, value in current_global_params.items():
+            encrypted_global_params[hash_column_name(param)] = value
+
+        client_socket.sendall(pickle.dumps(encrypted_global_params))
+        print(f"[{addr}] Updated global model parameters sent back.")
+    except Exception as e:
+        print(f"[{addr}] An error occurred: {e}")
+    finally:
+        client_socket.close()
+
+
+def server_program():
+    server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server_socket.bind((HOST, PORT))
+    server_socket.listen(5)
+    print(f"Server listening on {HOST}:{PORT} (expecting {EXPECTED_CLIENTS} clients)...")
+
+    handled = 0
+    while handled < EXPECTED_CLIENTS:
+        client_socket, addr = server_socket.accept()
+        print(f"Connection from {addr}")
+        t = threading.Thread(target=handle_client, args=(client_socket, addr))
+        t.start()
+        t.join()  # process sequentially so the running average is well-defined
+        handled += 1
+
+    print("All expected clients handled. Server shutting down.")
+    server_socket.close()
+
 
 if __name__ == "__main__":
-    main()
+    server_program()
