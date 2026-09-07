@@ -1,0 +1,10 @@
+{
+  "ExpandedNodes": [
+    "",
+    "\\lib",
+    "\\lib\\screens",
+    "\\lib\\services"
+  ],
+  "SelectedNode": "\\lib\\services\\onnx_service.dart",
+  "PreviewInSolutionExplorer": false
+}
